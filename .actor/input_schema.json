@@ -1,0 +1,83 @@
+{
+    "title": "NGOBase Scraper",
+    "description": "Collect public NGO, charity, and nonprofit listings from NGOBase using a keyword or location and work-area filters.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "keyword": {
+            "title": "Keyword",
+            "type": "string",
+            "description": "Search NGO names and public listing text. Takes priority over location and work-area filters.",
+            "editor": "textfield"
+        },
+        "country": {
+            "title": "Country",
+            "type": "string",
+            "description": "Country name or NGOBase country code, for example United States or US. Used when no keyword is supplied.",
+            "editor": "textfield"
+        },
+        "state": {
+            "title": "State or province",
+            "type": "string",
+            "description": "Optional state or province name/code. A country is required when using this field.",
+            "editor": "textfield"
+        },
+        "city": {
+            "title": "City",
+            "type": "string",
+            "description": "Optional city name or NGOBase city value. A country is required when using this field.",
+            "editor": "textfield"
+        },
+        "workArea": {
+            "title": "Work area",
+            "type": "string",
+            "description": "Work area name or NGOBase code, for example Health or HLT.",
+            "editor": "textfield"
+        },
+        "subWorkArea": {
+            "title": "Sub work area",
+            "type": "string",
+            "description": "Optional sub work area name or NGOBase code. A work area is recommended.",
+            "editor": "textfield"
+        },
+        "sorting": {
+            "title": "Sorting",
+            "type": "string",
+            "description": "Result order.",
+            "editor": "select",
+            "enum": ["default", "name_a_to_z", "year_new_to_old"],
+            "enumTitles": ["Default popularity order", "NGO name A to Z", "Year established newest to oldest"],
+            "default": "default",
+            "prefill": "default"
+        },
+        "resultsWanted": {
+            "title": "Results wanted",
+            "type": "integer",
+            "description": "Maximum number of unique NGO records to save.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "maxPages": {
+            "title": "Maximum pages",
+            "type": "integer",
+            "description": "Maximum listing pages to request for the selected search target.",
+            "minimum": 1,
+            "default": 10,
+            "prefill": 3,
+            "editor": "number"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Optional Apify Proxy configuration for reliable runs.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

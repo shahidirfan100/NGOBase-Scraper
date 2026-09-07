@@ -1,0 +1,11 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "NGOBase Scraper output",
+    "properties": {
+        "overview": {
+            "type": "string",
+            "title": "NGO listings",
+            "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
+        }
+    }
+}

@@ -1,0 +1,136 @@
+{
+    "actorSpecification": 1,
+    "title": "NGOBase Scraper dataset",
+    "description": "Structured NGO, charity, and nonprofit listings collected from NGOBase.",
+    "fields": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "title": "NGO ID",
+                "type": "string",
+                "description": "NGOBase profile identifier when available."
+            },
+            "name": {
+                "title": "NGO name",
+                "type": "string",
+                "description": "Public NGO, charity, or nonprofit name."
+            },
+            "url": {
+                "title": "Profile URL",
+                "type": "string",
+                "description": "NGOBase profile URL."
+            },
+            "logo": {
+                "title": "Logo URL",
+                "type": "string",
+                "description": "Public organization logo URL when available."
+            },
+            "website": {
+                "title": "Website",
+                "type": "string",
+                "description": "Organization website when published."
+            },
+            "facebook": {
+                "title": "Facebook URL",
+                "type": "string",
+                "description": "Facebook page when published."
+            },
+            "linkedin": {
+                "title": "LinkedIn URL",
+                "type": "string",
+                "description": "LinkedIn page when published."
+            },
+            "city": {
+                "title": "City",
+                "type": "string",
+                "description": "Organization city."
+            },
+            "country": {
+                "title": "Country",
+                "type": "string",
+                "description": "Organization country."
+            },
+            "work_areas": {
+                "title": "Work areas",
+                "type": "array",
+                "description": "Published work areas and sub-areas.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "area": {
+                            "type": "string",
+                            "description": "Published NGO work area."
+                        },
+                        "sub_area": {
+                            "type": "string",
+                            "description": "Published NGO sub-work area when available."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "description": {
+                "title": "Description",
+                "type": "string",
+                "description": "Short public organization introduction when available."
+            },
+            "source_url": {
+                "title": "Source listing URL",
+                "type": "string",
+                "description": "Listing page from which the record was collected."
+            },
+            "source": {
+                "title": "Source",
+                "type": "string",
+                "description": "Source website."
+            },
+            "scraped_at": {
+                "title": "Scraped at",
+                "type": "string",
+                "description": "UTC timestamp for the collection run."
+            }
+        },
+        "additionalProperties": false
+    },
+    "views": {
+        "overview": {
+            "title": "NGO listings",
+            "transformation": {
+                "fields": ["name", "country", "city", "work_areas", "website", "url", "description"]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "name": {
+                        "label": "Name",
+                        "format": "text"
+                    },
+                    "country": {
+                        "label": "Country",
+                        "format": "text"
+                    },
+                    "city": {
+                        "label": "City",
+                        "format": "text"
+                    },
+                    "work_areas": {
+                        "label": "Work areas",
+                        "format": "array"
+                    },
+                    "website": {
+                        "label": "Website",
+                        "format": "link"
+                    },
+                    "url": {
+                        "label": "Profile",
+                        "format": "link"
+                    },
+                    "description": {
+                        "label": "Description",
+                        "format": "text"
+                    }
+                }
+            }
+        }
+    }
+}
