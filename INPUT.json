@@ -1,7 +1,6 @@
 {
-    "country": "Pakistan",
-    "workArea": "Health",
-    "sorting": "name_a_to_z",
-    "resultsWanted": 5,
-    "maxPages": 2
+    "keyword": "UNICEF",
+    "sorting": "default",
+    "resultsWanted": 20,
+    "maxPages": 3
 }
