@@ -7,8 +7,9 @@
         "keyword": {
             "title": "Keyword",
             "type": "string",
-            "description": "Search NGO names and public listing text. Takes priority over location and work-area filters.",
-            "editor": "textfield"
+            "description": "Search NGO names and public listing text. Takes priority over location and work-area filters. Leave empty to browse the all-NGO listing.",
+            "editor": "textfield",
+            "prefill": "UNICEF"
         },
         "country": {
             "title": "Country",
@@ -47,8 +48,7 @@
             "editor": "select",
             "enum": ["default", "name_a_to_z", "year_new_to_old"],
             "enumTitles": ["Default popularity order", "NGO name A to Z", "Year established newest to oldest"],
-            "default": "default",
-            "prefill": "default"
+            "default": "default"
         },
         "resultsWanted": {
             "title": "Results wanted",
@@ -56,7 +56,6 @@
             "description": "Maximum number of unique NGO records to save.",
             "minimum": 1,
             "default": 20,
-            "prefill": 20,
             "editor": "number"
         },
         "maxPages": {
@@ -65,18 +64,17 @@
             "description": "Maximum listing pages to request for the selected search target.",
             "minimum": 1,
             "default": 10,
-            "prefill": 3,
             "editor": "number"
         },
         "proxyConfiguration": {
             "title": "Proxy configuration",
             "type": "object",
-            "description": "Optional Apify Proxy configuration for reliable runs.",
+            "description": "Optional proxy settings. NGOBase uses an interactive Cloudflare challenge that Apify Proxy cannot complete, so runs work best with no proxy (the default) or a custom unblocking proxy URL.",
             "editor": "proxy",
             "default": {
-                "useApifyProxy": true
+                "useApifyProxy": false
             }
-    
+        }
     },
     "required": [],
     "additionalProperties": false
