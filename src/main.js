@@ -16,7 +16,22 @@ const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 30000;
 const RETRY_BASE_DELAY_MS = 1000;
 const RETRY_MAX_DELAY_MS = 10000;
+const NAV_MAX_ATTEMPTS = 3;
+const CHALLENGE_WAIT_MS = 60000;
+const CHALLENGE_MAX_RELOADS = 3;
+const BROWSER_WARMUP_ATTEMPTS = 3;
+const DIRECT_FALLBACK_ATTEMPTS = 2;
 const SORT_VALUES = new Set(['', 'name_a_to_z', 'year_new_to_old']);
+const EXCLUDED_IMPIT_HEADERS = new Set([
+    'cookie',
+    'host',
+    'connection',
+    'content-length',
+    'content-type',
+    'accept-encoding',
+    'referer',
+    'origin',
+]);
 
 let browserSession;
 
@@ -321,7 +336,6 @@ async function fetchHtml(client, url, cookieJar, referer, label) {
         {
             method: 'GET',
             headers: {
-                accept: 'text/html,application/xhtml+xml',
                 ...(referer && { referer }),
             },
         },
@@ -375,16 +389,53 @@ export function applySort(url, sort, sortBase) {
     return sortedUrl.href;
 }
 
-function getProxyUrl(proxyConfiguration, proxyConfigurationObject) {
-    if (proxyConfigurationObject) return proxyConfigurationObject.newUrl();
+function getStaticProxyUrl(proxyConfiguration) {
     if (!Actor.isAtHome() && Array.isArray(proxyConfiguration?.proxyUrls) && proxyConfiguration.proxyUrls.length > 0) {
         return proxyConfiguration.proxyUrls[0];
     }
     return undefined;
 }
 
+function createProxyUrlProvider(proxyConfigurationObject, staticProxyUrl) {
+    if (proxyConfigurationObject) {
+        return async () => {
+            try {
+                return await proxyConfigurationObject.newUrl();
+            } catch {
+                return staticProxyUrl;
+            }
+        };
+    }
+    return async () => staticProxyUrl;
+}
+
 function isAccessChallengeError(error) {
     return /HTTP 403|access denied|cloudflare|challenge|just a moment/i.test(String(error?.message || error));
+}
+
+function isNavigationError(error) {
+    return /ERR_CONNECTION|ERR_NETWORK|ERR_TIMED_OUT|ERR_ABORTED|ERR_EMPTY_RESPONSE|frame was detached|Target closed|navigating/i.test(
+        String(error?.message || error),
+    );
+}
+
+async function readPageContent(page) {
+    try {
+        return await page.content();
+    } catch {
+        return '';
+    }
+}
+
+function toImpitHeaders(headers) {
+    const result = {};
+    for (const [name, value] of Object.entries(headers || {})) {
+        const key = String(name).toLowerCase();
+        if (EXCLUDED_IMPIT_HEADERS.has(key)) continue;
+        if (typeof value !== 'string' || !value.trim()) continue;
+        result[name] = value;
+    }
+    return result;
 }
 
 function toPlaywrightProxy(proxyUrl) {
@@ -417,7 +468,9 @@ function browserResponse(status, url, headers, body) {
 }
 
 function isChallengeHtml(html) {
-    return /just a moment|checking your browser|challenge-platform|cf-chl|access denied/i.test(html);
+    return /just a moment|checking your browser|challenge-platform\/h\/|cf-mitigated|Enable JavaScript and cookies to continue/i.test(
+        html,
+    );
 }
 
 function hasNgoBaseContent(html) {
@@ -425,38 +478,110 @@ function hasNgoBaseContent(html) {
 }
 
 async function createBrowserClient(proxyUrl) {
-    const context = await chromium.launchPersistentContext(join(tmpdir(), `ngobase-profile-${process.pid}`), {
-        channel: 'chrome',
-        headless: false,
-        noViewport: true,
-        ...(proxyUrl && { proxy: toPlaywrightProxy(proxyUrl) }),
-    });
+    const context = await chromium.launchPersistentContext(
+        join(tmpdir(), `ngobase-profile-${process.pid}-${Date.now()}`),
+        {
+            channel: 'chrome',
+            headless: false,
+            noViewport: true,
+            ...(proxyUrl && { proxy: toPlaywrightProxy(proxyUrl) }),
+        },
+    );
     const page = await context.newPage();
+    let capturedHeaders = {};
+
+    page.on('request', (request) => {
+        try {
+            if (request.isNavigationRequest() && request.resourceType() === 'document') {
+                capturedHeaders = { ...request.headers() };
+            }
+        } catch {
+            // Ignore headers that disappear while the request is being inspected.
+        }
+    });
+
+    page.on('requestfailed', (request) => {
+        const failedUrl = request.url();
+        if (/challenge-platform|challenges\.cloudflare\.com|__cf/i.test(failedUrl)) {
+            log.warning(`Cloudflare request failed: ${request.failure()?.errorText} | ${failedUrl.slice(0, 160)}`);
+        }
+    });
+
+    page.on('response', (response) => {
+        const responseUrl = response.url();
+        if (/challenge-platform|challenges\.cloudflare\.com/i.test(responseUrl) && response.status() >= 400) {
+            log.warning(`Cloudflare response ${response.status()} | ${responseUrl.slice(0, 160)}`);
+        }
+    });
+
+    const waitForChallengeResolution = async (timeout) => {
+        const deadline = Date.now() + CHALLENGE_WAIT_MS;
+        let html = '';
+        let reloads = 0;
+
+        while (Date.now() < deadline) {
+            await page.waitForLoadState('domcontentloaded', { timeout: Math.min(timeout, 10000) }).catch(() => {});
+            await page.waitForTimeout(1200);
+            html = await readPageContent(page);
+            if (hasNgoBaseContent(html)) return html;
+
+            if (reloads < CHALLENGE_MAX_RELOADS) {
+                reloads++;
+                await page.reload({ waitUntil: 'commit', timeout }).catch(() => {});
+            }
+        }
+
+        return html;
+    };
+
+    const describeChallenge = async () => {
+        try {
+            const details = await page.evaluate(() => ({
+                title: document.title,
+                webdriver: Boolean(navigator.webdriver),
+                turnstileFrames: document.querySelectorAll(
+                    'iframe[src*="challenges.cloudflare.com"], #challenge-stage, #challenge-running, #challenge-form',
+                ).length,
+                hasChrome: Boolean(window.chrome),
+                ua: navigator.userAgent,
+            }));
+            return `title="${details.title}" webdriver=${details.webdriver} turnstile=${details.turnstileFrames} chrome=${details.hasChrome} ua="${details.ua}"`;
+        } catch {
+            return 'diagnostics unavailable';
+        }
+    };
 
     const client = {
         async fetch(url, options = {}) {
             const method = options.method || 'GET';
             const timeout = options.timeout ?? REQUEST_TIMEOUT_MS;
+            const referer = options.headers?.get?.('referer');
 
             if (method === 'GET') {
-                const response = await page.goto(url, {
-                    waitUntil: 'commit',
-                    timeout,
-                    ...(options.headers?.get?.('referer') && { referer: options.headers.get('referer') }),
-                });
-                await page.waitForLoadState('domcontentloaded', { timeout: Math.min(timeout, 10000) }).catch(() => {});
-                let html = await page.content();
-                for (let attempt = 0; attempt < 3 && isChallengeHtml(html); attempt++) {
-                    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-                    await page.waitForTimeout(5000 * (attempt + 1));
-                    html = await page.content();
+                let response;
+                for (let attempt = 1; attempt <= NAV_MAX_ATTEMPTS; attempt++) {
+                    try {
+                        response = await page.goto(url, {
+                            waitUntil: 'commit',
+                            timeout,
+                            ...(referer && { referer }),
+                        });
+                        break;
+                    } catch (error) {
+                        if (!isNavigationError(error) || attempt === NAV_MAX_ATTEMPTS) throw error;
+                        await sleep(1000 * attempt);
+                    }
                 }
 
+                const html = await waitForChallengeResolution(timeout);
                 const responseHeaders = response?.headers() || { 'content-type': 'text/html; charset=UTF-8' };
                 const responseStatus = response?.status();
                 let status = responseStatus || 200;
                 if (hasNgoBaseContent(html)) status = 200;
-                else if (isChallengeHtml(html)) status = responseStatus || 403;
+                else if (isChallengeHtml(html)) {
+                    status = responseStatus || 403;
+                    log.warning(`NGOBase challenge unresolved | ${await describeChallenge()}`);
+                }
                 return browserResponse(status, page.url(), responseHeaders, html);
             }
 
@@ -488,16 +613,78 @@ async function createBrowserClient(proxyUrl) {
             return browserResponse(result.status, result.url || url, result.headers, result.body);
         },
         getCookies: async () => context.cookies('https://ngobase.org'),
+        getHeaders: async () => {
+            const headers = { ...capturedHeaders };
+            if (!headers['user-agent']) {
+                headers['user-agent'] = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+            }
+            if (!headers['accept-language']) {
+                const language = await page.evaluate(() => navigator.language).catch(() => undefined);
+                if (language) headers['accept-language'] = `${language},en;q=0.9`;
+            }
+            return toImpitHeaders(headers);
+        },
     };
 
     return {
         client,
         getCookies: client.getCookies,
+        getHeaders: client.getHeaders,
         close: async () => {
-            await page.close();
-            await context.close();
+            await page.close().catch(() => {});
+            await context.close().catch(() => {});
         },
     };
+}
+
+async function warmUpBrowser(proxyPlans, warmupUrl, cookieJar) {
+    let lastError;
+
+    for (const plan of proxyPlans) {
+        for (let attempt = 1; attempt <= plan.attempts; attempt++) {
+            const proxyUrl = await plan.provide();
+            let session;
+
+            try {
+                session = await createBrowserClient(proxyUrl);
+            } catch (error) {
+                lastError = error;
+                log.warning(`Patchright launch failed (${plan.label}, ${attempt}/${plan.attempts}): ${error.message}`);
+                continue;
+            }
+
+            try {
+                const response = await session.client.fetch(warmupUrl, {
+                    method: 'GET',
+                    headers: new Headers({ accept: 'text/html,application/xhtml+xml' }),
+                    timeout: REQUEST_TIMEOUT_MS,
+                });
+                const html = await response.text().catch(() => '');
+                seedCookieJar(cookieJar, await session.getCookies());
+
+                if (hasNgoBaseContent(html)) {
+                    const browserHeaders = await session.getHeaders();
+                    log.info(
+                        `Patchright warm-up completed | ${plan.label} | attempt=${attempt} | cookies=${cookieJar.size}`,
+                    );
+                    return { session, browserHeaders, proxyUrl };
+                }
+
+                lastError = new Error(`${plan.label}: warm-up challenge not resolved (HTTP ${response.status})`);
+                log.warning(
+                    `Patchright warm-up challenge not resolved (${plan.label}, ${attempt}/${plan.attempts}); rotating session.`,
+                );
+            } catch (error) {
+                lastError = error;
+                seedCookieJar(cookieJar, await session.getCookies().catch(() => []));
+                log.warning(`Patchright warm-up failed (${plan.label}, ${attempt}/${plan.attempts}): ${error.message}`);
+            }
+
+            await session.close().catch(() => {});
+        }
+    }
+
+    throw new Error(`NGOBase browser warm-up failed after all attempts: ${lastError?.message}`);
 }
 
 export async function resolveFilterTarget(client, input, cookieJar, bootstrap) {
@@ -626,6 +813,9 @@ async function getInput() {
     const actorInput = await Actor.getInput();
     if (actorInput && Object.keys(actorInput).length > 0) return actorInput;
 
+    // Local development only: never inject fixtures into Apify platform runs.
+    if (Actor.isAtHome()) return {};
+
     try {
         const fallback = await readFile(new URL('../INPUT.json', import.meta.url), 'utf8');
         return JSON.parse(fallback);
@@ -642,32 +832,40 @@ async function run() {
     const { proxyConfiguration } = input;
     const proxyConfigurationObject =
         proxyConfiguration && Actor.isAtHome() ? await Actor.createProxyConfiguration(proxyConfiguration) : undefined;
-    const proxyUrl = await getProxyUrl(proxyConfiguration, proxyConfigurationObject);
+    const staticProxyUrl = getStaticProxyUrl(proxyConfiguration);
+    const hasConfiguredProxy = Boolean(proxyConfigurationObject) || Boolean(staticProxyUrl);
+    const proxyPlans = [];
+
+    if (hasConfiguredProxy) {
+        proxyPlans.push({
+            label: 'configured proxy',
+            provide: createProxyUrlProvider(proxyConfigurationObject, staticProxyUrl),
+            attempts: BROWSER_WARMUP_ATTEMPTS,
+        });
+    }
+    proxyPlans.push({
+        label: hasConfiguredProxy ? 'direct fallback' : 'direct connection',
+        provide: async () => undefined,
+        attempts: hasConfiguredProxy ? DIRECT_FALLBACK_ATTEMPTS : BROWSER_WARMUP_ATTEMPTS,
+    });
+
+    if (hasConfiguredProxy) {
+        log.warning(
+            'Configured proxy detected; a direct-connection fallback is enabled if the proxy cannot clear Cloudflare.',
+        );
+    }
+
     const cookieJar = new Map();
     const warmupUrl = input.keyword ? buildKeywordUrl(input.keyword) : BASE_URL;
 
     log.info(`Starting Patchright session warm-up | target=${new URL(warmupUrl).pathname}`);
-    browserSession = await createBrowserClient(proxyUrl);
-    try {
-        const warmupResponse = await browserSession.client.fetch(warmupUrl, {
-            method: 'GET',
-            headers: new Headers({ accept: 'text/html,application/xhtml+xml' }),
-            timeout: REQUEST_TIMEOUT_MS,
-        });
-        seedCookieJar(cookieJar, await browserSession.getCookies());
-        if (!warmupResponse.ok) {
-            log.warning(`Patchright warm-up returned HTTP ${warmupResponse.status}; continuing with shared session.`);
-        } else {
-            log.info(`Patchright warm-up completed | cookies=${cookieJar.size}`);
-        }
-    } catch (error) {
-        seedCookieJar(cookieJar, await browserSession.getCookies());
-        log.warning(`Patchright warm-up did not complete: ${error.message}`);
-    }
+    const { session, browserHeaders, proxyUrl } = await warmUpBrowser(proxyPlans, warmupUrl, cookieJar);
+    browserSession = session;
 
     const impitClient = new Impit({
         browser: 'chrome',
         ...(proxyUrl && { proxyUrl }),
+        ...(Object.keys(browserHeaders).length > 0 && { headers: browserHeaders }),
     });
     let activeClient = impitClient;
 
@@ -684,7 +882,7 @@ async function run() {
     try {
         targets = await prepareTargets(activeClient, input, cookieJar);
     } catch (error) {
-        if (!isAccessChallengeError(error)) throw error;
+        if (activeClient !== impitClient || !isAccessChallengeError(error)) throw error;
         await switchToBrowser();
         targets = await prepareTargets(activeClient, input, cookieJar);
     }
@@ -736,13 +934,19 @@ async function run() {
 
 async function main() {
     await Actor.init();
+    let failure;
     try {
         await run();
     } catch (error) {
-        log.exception(error, 'NGOBase run failed');
-        await Actor.fail();
+        failure = error;
     } finally {
-        if (browserSession) await browserSession.close();
+        if (browserSession) await browserSession.close().catch(() => {});
+    }
+
+    if (failure) {
+        log.exception(failure, 'NGOBase run failed');
+        await Actor.fail();
+    } else {
         await Actor.exit();
     }
 }

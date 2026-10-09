@@ -76,7 +76,7 @@
             "default": {
                 "useApifyProxy": true
             }
-        }
+    
     },
     "required": [],
     "additionalProperties": false

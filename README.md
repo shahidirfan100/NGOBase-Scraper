@@ -57,7 +57,7 @@ Keyword input takes priority over location and work-area filters. When no search
 | `sorting` | String | No | `default` | `default`, `name_a_to_z`, or `year_new_to_old` |
 | `resultsWanted` | Integer | No | `20` | Maximum unique records to save |
 | `maxPages` | Integer | No | `10` | Maximum pages per target |
-| `proxyConfiguration` | Object | No | Apify Proxy | Optional proxy settings |
+| `proxyConfiguration` | Object | No | No proxy | Optional proxy settings. Runs work best with no proxy or a custom unblocking proxy URL. |
 
 For a city filter, provide a country as well. The Actor resolves names against NGOBase’s public filter values, so users do not need to know internal location codes.
 
@@ -133,7 +133,7 @@ Collect organizations listed in Toronto:
 
 - Use `country` together with `city` for the most precise city filter.
 - Use `maxPages` as a safety limit for broad country and global searches.
-- Enable Apify Proxy for larger or scheduled runs, or when NGOBase returns an access challenge.
+- Keep the default "no proxy" setting for reliable runs. NGOBase uses an interactive browser check that standard Apify Proxy groups cannot complete; supply a custom unblocking proxy URL only if you have one.
 - Review the dataset preview before connecting it to a production workflow.
 - Public listings can change. Report changed fields or missing pages through the Actor Issues tab.
 
