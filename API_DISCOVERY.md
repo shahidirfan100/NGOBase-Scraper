@@ -2,9 +2,9 @@
 
 ## Result
 
-NGOBase does not expose a usable JSON endpoint for NGO listing or detail records. The verified production source is the public server-rendered listing route requested directly over HTTP. The actor warms one Patchright Chrome session to clear the Cloudflare managed challenge, transfers the live browser cookies and headers to a shared `impit` client for fast direct requests, and parses responses with Cheerio.
+NGOBase does not expose a usable JSON endpoint for NGO listing or detail records. The verified production source is the public server-rendered listing route requested directly over HTTP. The actor parses responses with Cheerio.
 
-This decision follows the approved fallback to direct HTTP plus HTML parsing after the API-only option was tested and rejected. Direct HTTP only works after a real browser has obtained the Cloudflare clearance cookie, so the browser warm-up is part of the verified request flow.
+Request flow is **direct-first and auto-healing**: the actor tries `impit` direct requests across a rotation of verified browser profiles. It only warms one Patchright Chrome session when every direct profile is challenged, transfers the live browser cookies and headers to the shared `impit` client, and reuses the warmed session if `impit` is challenged again mid-run. This decision follows the approved fallback to direct HTTP plus HTML parsing after the API-only option was tested and rejected.
 
 ## Discovery evidence
 
@@ -46,44 +46,86 @@ Missing values are omitted from dataset items rather than emitted as `null`.
 
 ## Anti-blocking notes
 
-NGOBase serves a Cloudflare **managed challenge** (`cf-mitigated: challenge`,
-`cType: 'managed'`) on the listing routes. A real browser must solve it; no plain
-HTTP client can clear it on its own.
+NGOBase serves a Cloudflare **managed challenge** on the listing routes for
+flagged clients. Plain HTTP clients are only challenged when the request IP or
+fingerprint is flagged; a browser is not always required.
 
-- The actor starts one Patchright real Chrome persistent context using `channel: chrome`, `headless: false`, and `noViewport: true`.
-- The browser client is auto-healing: it retries transient navigation errors
-  (`ERR_CONNECTION_RESET`, `ERR_ABORTED`, and similar), tolerates
-  `page.content()` races while the challenge is navigating, and reloads up to
-  three times inside a 60-second window until verified NGOBase content appears.
-- Warm-up is mandatory and rotates the connection for up to three attempts.
-  Empty challenge HTML is not accepted as success; only verified NGOBase content
-  ends the warm-up.
-- Verified cloud behavior: the Cloudflare challenge needs its own sub-resources
-  (`challenges.cloudflare.com`, `brunhild.challenges.cloudflare.com`). **Apify
-  Proxy fails these with `ERR_TUNNEL_CONNECTION_FAILED` and HTTP `401`, so the
-  challenge never resolves through Apify Proxy** (datacenter and residential
-  groups both failed). A direct connection from the Actor container clears the
-  challenge on the first attempt. This is why the default is now
-  `proxyConfiguration: { "useApifyProxy": false }`.
-- Auto-healing proxy handling: if a proxy is configured, the actor tries it
-  first, then automatically falls back to a direct connection and logs a
-  warning. The proxy is never retried after the fallback succeeds.
-- After the challenge resolves, the actor captures the live navigation request
-  headers (user agent, `accept`, `accept-language`, `sec-ch-ua`, and other
-  browser values) and the browser cookies, then transfers them to one shared
-  `impit` client that uses the **same connection** (proxy or direct).
-- Verified: once the browser holds a valid `cf_clearance` cookie, impit with the
-  browser's exact user agent and cookies returns `HTTP 200` with NGO content on
-  `chrome`, `chrome131`, `chrome151`, and `firefox144`.
-- Impit is the fast path. If impit is challenged, the actor reuses the already
-  warmed Patchright session for filter resolution and listing requests; it never
-  launches a second browser.
-- Baseline impit-only behavior against the listing route (no browser clearance):
-  `chrome`, `chrome124`-`chrome151`, `firefox*`, and `okhttp*` returned the
-  Cloudflare `403` challenge; legacy `chrome100`-`chrome116` and `ios18` failed
-  the TLS handshake. This is why impit is only used after browser clearance.
+### Verified request order (auto-healing)
+
+1. **Direct `impit` request first.** The actor requests the target URL with one
+   shared `impit` client. No browser is launched when the direct request returns
+   real NGOBase content.
+2. **Profile rotation on challenge.** If a direct request returns the Cloudflare
+   challenge page, the actor rotates through the verified `impit` profiles
+   (`chrome`, `firefox`, `chrome131`, `okhttp`) before giving up on direct HTTP.
+   Rotation also applies if a challenge appears mid-run.
+3. **Browser warm-up only as a fallback.** If every direct profile is challenged,
+   the actor launches one Patchright real Chrome persistent context
+   (`channel: chrome`, `headless: false`, `noViewport: true`), waits for the
+   managed challenge, and transfers the browser cookies and navigation headers to
+   `impit`. The warmed session is reused directly if `impit` is challenged again.
+4. **Bounded recovery.** Browser warm-up is non-fatal: if it cannot clear the
+   challenge, the actor reports a clear error instead of crashing, and each
+   request uses only bounded retries with `Retry-After` or capped exponential
+   backoff.
+
+### Verified impit profile behavior (direct request, live listing route)
+
+Checked against `https://ngobase.org/list_searched_ngos_v`:
+
+| Profiles                                        | Result                          |
+| ----------------------------------------------- | ------------------------------- |
+| `chrome`, `chrome124`-`chrome151`, `firefox*`, `okhttp*` | HTTP 200 with NGO content |
+| `chrome100`-`chrome116`, `ios18`                | TLS handshake failure (excluded) |
+
+The actor therefore only rotates among profiles verified to complete the TLS
+handshake: `chrome`, `firefox`, `chrome131`, `okhttp`.
+
+### Cloudflare challenge root cause (why browser warm-up can fail)
+
+Since around July 2026 Cloudflare's interactive challenge loads a subresource
+from `brunhild.challenges.cloudflare.com`, which publishes **AAAA (IPv6) records
+only and no A record**. On an IPv4-only host (such as the default Actor
+container) that name resolves to nothing, so the browser logs
+`net::ERR_NAME_NOT_RESOLVED` for `brunhild.challenges.cloudflare.com`, the
+challenge widget never loads, and the challenge page spins forever. The
+`challenges.cloudflare.com/.../pat/` requests returning `401` are the optional
+Private Access Token probe and are expected, not the failure cause.
+
+Because the browser challenge cannot be cleared on an IPv6-only-widget network,
+direct HTTP is the primary and most reliable path. The actor must not require a
+browser warm-up to start.
+
+### Proxy behavior
+
+- The default is `proxyConfiguration: { "useApifyProxy": false }`.
+- **Verified online (Apify cloud):** a no-proxy run succeeded. `chrome` was
+  challenged on the datacenter IP, the actor rotated to the `firefox` profile,
+  and that profile returned NGO content. Profile rotation is what clears the
+  challenge; a browser is not required.
+- **Verified online (Apify cloud):** an Apify **residential** proxy run also
+  succeeded, returning content on the first profile (`chrome`). Residential
+  proxy is a supported optional layer, not a requirement.
+- Verified: Apify Proxy cannot `CONNECT` to `challenges.cloudflare.com`
+  (`ERR_TUNNEL_CONNECTION_FAILED` / `401`), so it cannot clear the *browser*
+  challenge. This does not affect direct requests, which do not need the
+  challenge widget.
+- If a proxy is configured, the actor tries it first for both direct `impit`
+  requests and browser warm-up, then automatically falls back to a direct
+  connection and logs a warning. The proxy is never retried after a successful
+  fallback.
 - A custom unblocking proxy can be supplied through `proxyConfiguration.proxyUrls`.
-  It must allow `CONNECT` to `challenges.cloudflare.com`, otherwise the direct
-  fallback is used.
+
+### Cloudflare and browser warm-up
+
+- `brunhild.challenges.cloudflare.com` publishes AAAA (IPv6) records only. On an
+  IPv4-only host the browser challenge widget cannot load, which is why the
+  browser is only a fallback and why direct requests are attempted first.
+
+### Other verified details
+
 - Cloudflare response headers can be multiline; they are sanitized before use.
 - CSRF and session cookies are carried for filter-resolution requests.
+- The browser client captures live navigation request headers (user agent,
+  `accept`, `accept-language`, `sec-ch-ua`, and other browser values) and cookies,
+  then transfers them to the shared `impit` client on the same connection.

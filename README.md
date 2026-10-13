@@ -133,7 +133,7 @@ Collect organizations listed in Toronto:
 
 - Use `country` together with `city` for the most precise city filter.
 - Use `maxPages` as a safety limit for broad country and global searches.
-- Keep the default "no proxy" setting for reliable runs. NGOBase uses an interactive browser check that standard Apify Proxy groups cannot complete; supply a custom unblocking proxy URL only if you have one.
+- Keep the default "no proxy" setting. The Actor handles the source's access check automatically and does not need a proxy; Apify residential proxy is also supported if you prefer to route requests through it.
 - Review the dataset preview before connecting it to a production workflow.
 - Public listings can change. Report changed fields or missing pages through the Actor Issues tab.
 

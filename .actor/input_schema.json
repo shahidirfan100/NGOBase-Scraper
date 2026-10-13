@@ -69,7 +69,7 @@
         "proxyConfiguration": {
             "title": "Proxy configuration",
             "type": "object",
-            "description": "Optional proxy settings. NGOBase uses an interactive Cloudflare challenge that Apify Proxy cannot complete, so runs work best with no proxy (the default) or a custom unblocking proxy URL.",
+            "description": "Optional proxy settings. Runs work without a proxy (the default): the Actor rotates request profiles to avoid the Cloudflare challenge. Apify residential proxy is also supported and reliably clears the challenge if you want an extra layer.",
             "editor": "proxy",
             "default": {
                 "useApifyProxy": false

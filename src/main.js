@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,8 +18,12 @@ const RETRY_MAX_DELAY_MS = 10000;
 const NAV_MAX_ATTEMPTS = 3;
 const CHALLENGE_WAIT_MS = 60000;
 const CHALLENGE_MAX_RELOADS = 3;
-const BROWSER_WARMUP_ATTEMPTS = 3;
+const BROWSER_WARMUP_ATTEMPTS = 2;
 const DIRECT_FALLBACK_ATTEMPTS = 2;
+// Impit browser profiles verified to complete the NGOBase TLS handshake and
+// return real listing content. Legacy profiles (chrome100-chrome116, ios18)
+// fail the TLS handshake and are intentionally excluded.
+const IMPIT_PROFILES = ['chrome', 'firefox', 'chrome131', 'okhttp'];
 const SORT_VALUES = new Set(['', 'name_a_to_z', 'year_new_to_old']);
 const EXCLUDED_IMPIT_HEADERS = new Set([
     'cookie',
@@ -32,8 +35,6 @@ const EXCLUDED_IMPIT_HEADERS = new Set([
     'referer',
     'origin',
 ]);
-
-let browserSession;
 
 function text(value) {
     return String(value || '')
@@ -329,6 +330,19 @@ async function readHtmlResponse(response, url, label) {
     return html;
 }
 
+// Reads the body of any response (including a Cloudflare challenge page) so the
+// caller can classify it instead of failing immediately on a non-2xx status.
+async function performFetch(client, url, options, cookieJar, label) {
+    const response = await fetchWithRetry(client, url, options, cookieJar, label);
+    let html = '';
+    try {
+        html = await response.text();
+    } catch (error) {
+        throw new Error(`${label}: could not read response body for ${url}: ${error.message}`);
+    }
+    return { response, html };
+}
+
 async function fetchHtml(client, url, cookieJar, referer, label) {
     const response = await fetchWithRetry(
         client,
@@ -484,6 +498,8 @@ async function createBrowserClient(proxyUrl) {
             channel: 'chrome',
             headless: false,
             noViewport: true,
+            locale: 'en-US',
+            args: ['--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
             ...(proxyUrl && { proxy: toPlaywrightProxy(proxyUrl) }),
         },
     );
@@ -687,6 +703,164 @@ async function warmUpBrowser(proxyPlans, warmupUrl, cookieJar) {
     throw new Error(`NGOBase browser warm-up failed after all attempts: ${lastError?.message}`);
 }
 
+// HTTP session manager. Direct impit requests are attempted first across a
+// rotation of verified browser profiles. The Patchright browser is warmed only
+// when every direct profile is challenged, and it is never a mandatory first
+// step. This keeps the actor running when the interactive challenge widget
+// cannot load (for example on IPv4-only hosts where Cloudflare's IPv6-only
+// challenge subresource cannot be resolved) as long as direct HTTP is allowed.
+function createSessionManager({ proxyPlans, initialProxyUrl }) {
+    const cookieJar = new Map();
+    const impitClients = new Map();
+    let profileCursor = 0;
+    let proxyUrl = initialProxyUrl;
+    let browserSession = null;
+    let browserHeaders = {};
+    let browserAttempted = false;
+    let usingBrowser = false;
+
+    const buildImpit = (profile) =>
+        new Impit({
+            browser: profile,
+            ...(proxyUrl !== undefined && { proxyUrl }),
+            ...(Object.keys(browserHeaders).length > 0 && { headers: browserHeaders }),
+        });
+
+    const getImpit = (profile) => {
+        if (!impitClients.has(profile)) impitClients.set(profile, buildImpit(profile));
+        return impitClients.get(profile);
+    };
+
+    const resetImpit = (headers) => {
+        browserHeaders = headers || {};
+        impitClients.clear();
+    };
+
+    const currentClient = () =>
+        usingBrowser && browserSession ? browserSession.client : getImpit(IMPIT_PROFILES[profileCursor]);
+
+    const classify = (response, html) => {
+        if (hasNgoBaseContent(html)) return 'content';
+        if (isChallengeHtml(html)) return 'challenge';
+        if (!html.trim()) return 'error';
+        return response.ok ? 'content' : 'error';
+    };
+
+    const fetchViaBrowser = async (url, referer, label) => {
+        const response = await browserSession.client.fetch(url, {
+            method: 'GET',
+            headers: new Headers(referer ? { referer } : {}),
+            timeout: REQUEST_TIMEOUT_MS,
+        });
+        const html = await response.text().catch(() => '');
+        seedCookieJar(cookieJar, await browserSession.getCookies().catch(() => []));
+        if (!response.ok && !hasNgoBaseContent(html)) {
+            throw new Error(`${label}: HTTP ${response.status} for ${url}`);
+        }
+        return { html, url: response.url || url };
+    };
+
+    const ensureBrowser = async (url) => {
+        if (browserSession) return true;
+        if (browserAttempted) return false;
+        browserAttempted = true;
+
+        try {
+            const warmed = await warmUpBrowser(proxyPlans, url, cookieJar);
+            browserSession = warmed.session;
+            if (warmed.proxyUrl !== undefined) proxyUrl = warmed.proxyUrl;
+            resetImpit(warmed.browserHeaders);
+            const chromeIndex = IMPIT_PROFILES.indexOf('chrome');
+            profileCursor = chromeIndex >= 0 ? chromeIndex : 0;
+            log.info(`Patchright session warmed | cookies=${cookieJar.size}`);
+            return true;
+        } catch (error) {
+            log.warning(`Patchright browser warm-up could not clear the challenge: ${error.message}`);
+            return false;
+        }
+    };
+
+    const activateBrowser = async (url) => {
+        if (browserSession || (await ensureBrowser(url))) {
+            usingBrowser = true;
+            return true;
+        }
+        return false;
+    };
+
+    return {
+        cookieJar,
+        client: () => currentClient(),
+        ensureBrowser,
+        activateBrowser,
+
+        // Establishes a working request path before targets are built.
+        async initialize(probeUrl) {
+            for (let attempt = 0; attempt < IMPIT_PROFILES.length; attempt++) {
+                const profile = IMPIT_PROFILES[profileCursor];
+                try {
+                    const { response, html } = await performFetch(
+                        getImpit(profile),
+                        probeUrl,
+                        { method: 'GET', headers: {} },
+                        cookieJar,
+                        'Direct warm-up',
+                    );
+                    const kind = classify(response, html);
+                    if (kind === 'content') {
+                        log.info(`Direct impit request succeeded | profile=${profile}`);
+                        return 'impit';
+                    }
+                    if (kind === 'challenge') {
+                        log.warning(`Direct request challenged | profile=${profile}; rotating profile.`);
+                    } else {
+                        log.warning(
+                            `Direct request returned HTTP ${response.status} | profile=${profile}; rotating profile.`,
+                        );
+                    }
+                } catch (error) {
+                    log.warning(`Direct request failed | profile=${profile}: ${error.message}`);
+                }
+                profileCursor = (profileCursor + 1) % IMPIT_PROFILES.length;
+            }
+
+            log.warning('No direct impit profile returned NGOBase content; starting Patchright browser warm-up.');
+            if (await ensureBrowser(probeUrl)) return 'browser';
+            throw new Error('NGOBase access challenge could not be cleared with any available client.');
+        },
+
+        // Auto-healing HTML fetch: rotates impit profiles, then falls back to the
+        // warmed browser, so a mid-run challenge does not end the run.
+        async fetchHtml(url, { referer, label }) {
+            if (usingBrowser && browserSession) return fetchViaBrowser(url, referer, label);
+
+            for (let attempt = 0; attempt < IMPIT_PROFILES.length; attempt++) {
+                const profile = IMPIT_PROFILES[profileCursor];
+                const { response, html } = await performFetch(
+                    getImpit(profile),
+                    url,
+                    { method: 'GET', headers: referer ? { referer } : {} },
+                    cookieJar,
+                    label,
+                );
+                const kind = classify(response, html);
+                if (kind === 'content') return { html, url: response.url || url };
+                if (kind === 'error') throw new Error(`${label}: HTTP ${response.status} for ${url}`);
+                log.warning(`${label}: challenge detected | profile=${profile}; rotating profile.`);
+                profileCursor = (profileCursor + 1) % IMPIT_PROFILES.length;
+            }
+
+            log.warning(`${label}: all direct profiles challenged; switching to the warmed browser session.`);
+            if (await activateBrowser(url)) return fetchViaBrowser(url, referer, label);
+            throw new Error(`${label}: NGOBase Cloudflare challenge could not be cleared for ${url}`);
+        },
+
+        async close() {
+            if (browserSession) await browserSession.close().catch(() => {});
+        },
+    };
+}
+
 export async function resolveFilterTarget(client, input, cookieJar, bootstrap) {
     const countryOptions = readSelectOptions(bootstrap.html, '#ngo_country');
     const workAreaOptions = readSelectOptions(bootstrap.html, '#work_area');
@@ -811,17 +985,10 @@ export async function prepareTargets(client, input, cookieJar) {
 
 async function getInput() {
     const actorInput = await Actor.getInput();
-    if (actorInput && Object.keys(actorInput).length > 0) return actorInput;
-
-    // Local development only: never inject fixtures into Apify platform runs.
-    if (Actor.isAtHome()) return {};
-
-    try {
-        const fallback = await readFile(new URL('../INPUT.json', import.meta.url), 'utf8');
-        return JSON.parse(fallback);
-    } catch {
-        return {};
-    }
+    // Actor.getInput() returns the resolved run input for both cloud and local
+    // runs (local input lives in storage/key_value_stores/default/INPUT.json).
+    // No schema prefills or local fixtures are merged into runtime input.
+    return actorInput && typeof actorInput === 'object' ? actorInput : {};
 }
 
 async function run() {
@@ -855,99 +1022,82 @@ async function run() {
         );
     }
 
-    const cookieJar = new Map();
+    // Use the configured proxy for direct impit requests too, so a custom
+    // unblocking proxy benefits the fast path instead of only the browser.
+    const initialProxyUrl = hasConfiguredProxy
+        ? await createProxyUrlProvider(proxyConfigurationObject, staticProxyUrl)()
+        : undefined;
+
     const warmupUrl = input.keyword ? buildKeywordUrl(input.keyword) : BASE_URL;
+    const session = createSessionManager({ proxyPlans, initialProxyUrl });
 
-    log.info(`Starting Patchright session warm-up | target=${new URL(warmupUrl).pathname}`);
-    const { session, browserHeaders, proxyUrl } = await warmUpBrowser(proxyPlans, warmupUrl, cookieJar);
-    browserSession = session;
-
-    const impitClient = new Impit({
-        browser: 'chrome',
-        ...(proxyUrl && { proxyUrl }),
-        ...(Object.keys(browserHeaders).length > 0 && { headers: browserHeaders }),
-    });
-    let activeClient = impitClient;
-
-    const switchToBrowser = async () => {
-        if (activeClient !== browserSession.client) {
-            log.warning('NGOBase access challenge detected; reusing the warmed Patchright Chrome session.');
-        }
-        seedCookieJar(cookieJar, await browserSession.getCookies());
-        activeClient = browserSession.client;
-        return activeClient;
-    };
-
-    let targets;
     try {
-        targets = await prepareTargets(activeClient, input, cookieJar);
-    } catch (error) {
-        if (activeClient !== impitClient || !isAccessChallengeError(error)) throw error;
-        await switchToBrowser();
-        targets = await prepareTargets(activeClient, input, cookieJar);
-    }
-    const scrapedAt = new Date().toISOString();
-    const seen = new Set();
-    let saved = 0;
-    let pagesProcessed = 0;
+        log.info(`Starting NGOBase session | target=${new URL(warmupUrl).pathname}`);
+        await session.initialize(warmupUrl);
 
-    log.info(`Starting NGOBase run | targets=${targets.length} | results=${resultsWanted} | max_pages=${maxPages}`);
-
-    for (const target of targets) {
-        if (saved >= resultsWanted) break;
-        let pageUrl = applySort(target.url, sort, target.sortBase);
-
-        for (let pageIndex = 0; pageIndex < maxPages && saved < resultsWanted; pageIndex++) {
-            let response;
-            try {
-                response = await fetchHtml(activeClient, pageUrl, cookieJar, target.url, `Fetch page ${pageIndex + 1}`);
-            } catch (error) {
-                if (activeClient !== impitClient || !isAccessChallengeError(error)) throw error;
-                await switchToBrowser();
-                response = await fetchHtml(activeClient, pageUrl, cookieJar, target.url, `Fetch page ${pageIndex + 1}`);
-            }
-            pagesProcessed++;
-            const items = parseNgoListings(response.html, response.url, scrapedAt)
-                .filter((item) => {
-                    const key = item.url || item.id || `${item.name}-${item.city || ''}-${item.country || ''}`;
-                    if (seen.has(key)) return false;
-                    seen.add(key);
-                    return true;
-                })
-                .slice(0, resultsWanted - saved);
-
-            if (items.length > 0) {
-                await Dataset.pushData(items);
-                saved += items.length;
-                log.info(`Saved ${items.length} items | total=${saved}/${resultsWanted} | page=${pageIndex + 1}`);
-            }
-
-            const nextPage = extractNextPage(response.html, response.url);
-            if (!nextPage || items.length === 0) break;
-            pageUrl = nextPage;
+        let targets;
+        try {
+            targets = await prepareTargets(session.client(), input, session.cookieJar);
+        } catch (error) {
+            if (!isAccessChallengeError(error) || !(await session.activateBrowser(BASE_URL))) throw error;
+            targets = await prepareTargets(session.client(), input, session.cookieJar);
         }
-    }
 
-    if (saved === 0) throw new Error('NGOBase returned no NGO records for the supplied input.');
-    log.info(`Finished NGOBase run | saved=${saved} | pages=${pagesProcessed}`);
+        const scrapedAt = new Date().toISOString();
+        const seen = new Set();
+        let saved = 0;
+        let pagesProcessed = 0;
+
+        log.info(`Starting NGOBase run | targets=${targets.length} | results=${resultsWanted} | max_pages=${maxPages}`);
+
+        for (const target of targets) {
+            if (saved >= resultsWanted) break;
+            let pageUrl = applySort(target.url, sort, target.sortBase);
+
+            for (let pageIndex = 0; pageIndex < maxPages && saved < resultsWanted; pageIndex++) {
+                // Auto-heals here: rotates impit profiles and falls back to the
+                // warmed browser if Cloudflare challenges a page mid-run.
+                const response = await session.fetchHtml(pageUrl, {
+                    referer: target.url,
+                    label: `Fetch page ${pageIndex + 1}`,
+                });
+                pagesProcessed++;
+                const items = parseNgoListings(response.html, response.url, scrapedAt)
+                    .filter((item) => {
+                        const key = item.url || item.id || `${item.name}-${item.city || ''}-${item.country || ''}`;
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    })
+                    .slice(0, resultsWanted - saved);
+
+                if (items.length > 0) {
+                    await Dataset.pushData(items);
+                    saved += items.length;
+                    log.info(`Saved ${items.length} items | total=${saved}/${resultsWanted} | page=${pageIndex + 1}`);
+                }
+
+                const nextPage = extractNextPage(response.html, response.url);
+                if (!nextPage || items.length === 0) break;
+                pageUrl = nextPage;
+            }
+        }
+
+        if (saved === 0) throw new Error('NGOBase returned no NGO records for the supplied input.');
+        log.info(`Finished NGOBase run | saved=${saved} | pages=${pagesProcessed}`);
+    } finally {
+        await session.close();
+    }
 }
 
 async function main() {
     await Actor.init();
-    let failure;
     try {
         await run();
-    } catch (error) {
-        failure = error;
-    } finally {
-        if (browserSession) await browserSession.close().catch(() => {});
-    }
-
-    if (failure) {
-        log.exception(failure, 'NGOBase run failed');
-        await Actor.fail();
-    } else {
         await Actor.exit();
+    } catch (error) {
+        log.exception(error, 'NGOBase run failed');
+        await Actor.fail();
     }
 }
 
